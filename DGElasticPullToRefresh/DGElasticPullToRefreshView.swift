@@ -50,6 +50,21 @@ open class DGElasticPullToRefreshView: UIView {
     // MARK: -
     // MARK: Vars
     
+    var snapToTopOnInitialAnimatingBounce: Bool = true
+    
+    fileprivate var _justTransitionedToAnimatingBounce: Bool = false
+    fileprivate var justTransitionedToAnimatingBounce: Bool {
+        set {
+            _justTransitionedToAnimatingBounce = newValue
+        }
+        
+        get {
+            let result = _justTransitionedToAnimatingBounce
+            _justTransitionedToAnimatingBounce = false
+            return result
+        }
+    }
+    
     fileprivate var _state: DGElasticPullToRefreshState = .stopped
     fileprivate(set) var state: DGElasticPullToRefreshState {
         get { return _state }
@@ -86,6 +101,9 @@ open class DGElasticPullToRefreshView: UIView {
         }
     }
     
+    var ignoreDragging: Bool = false
+    var minOffsetToPull: CGFloat = DGElasticPullToRefreshConstants.MinOffsetToPull
+    
     var observing: Bool = false {
         didSet {
             guard let scrollView = scrollView() else { return }
@@ -104,6 +122,8 @@ open class DGElasticPullToRefreshView: UIView {
     }
     
     var fillColor: UIColor = .clear { didSet { shapeLayer.fillColor = fillColor.cgColor } }
+    public var pullSpringWithDamping: CGFloat = 0.43
+    public var waveEnable: Bool = true
     
     // MARK: Views
     
@@ -124,7 +144,7 @@ open class DGElasticPullToRefreshView: UIView {
         super.init(frame: CGRect.zero)
         
         displayLink = CADisplayLink(target: self, selector: #selector(DGElasticPullToRefreshView.displayLinkTick))
-        displayLink.add(to: RunLoop.main, forMode: RunLoopMode.commonModes)
+        displayLink.add(to: RunLoop.main, forMode: RunLoop.Mode.common)
         displayLink.isPaused = true
         
         shapeLayer.backgroundColor = UIColor.clear.cgColor
@@ -141,30 +161,30 @@ open class DGElasticPullToRefreshView: UIView {
         addSubview(r2ControlPointView)
         addSubview(r3ControlPointView)
         
-        NotificationCenter.default.addObserver(self, selector: #selector(DGElasticPullToRefreshView.applicationWillEnterForeground), name: NSNotification.Name.UIApplicationWillEnterForeground, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(DGElasticPullToRefreshView.applicationWillEnterForeground), name: UIApplication.willEnterForegroundNotification, object: nil)
     }
-
+    
     required public init?(coder aDecoder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
     }
     
     // MARK: -
-
+    
     /**
-    Has to be called when the receiver is no longer required. Otherwise the main loop holds a reference to the receiver which in turn will prevent the receiver from being deallocated.
-    */
+     Has to be called when the receiver is no longer required. Otherwise the main loop holds a reference to the receiver which in turn will prevent the receiver from being deallocated.
+     */
     func disassociateDisplayLink() {
         displayLink?.invalidate()
     }
-
+    
     deinit {
         observing = false
         NotificationCenter.default.removeObserver(self)
     }
-
+    
     // MARK: -
     // MARK: Observer
-
+    
     override open func observeValue(forKeyPath keyPath: String?, of object: Any?, change: [NSKeyValueChangeKey : Any]?, context: UnsafeMutableRawPointer?) {
         if keyPath == DGElasticPullToRefreshConstants.KeyPaths.ContentOffset {
             if let newContentOffset = change?[NSKeyValueChangeKey.newKey], let scrollView = scrollView() {
@@ -172,28 +192,31 @@ open class DGElasticPullToRefreshView: UIView {
                 if state.isAnyOf([.loading, .animatingToStopped]) && newContentOffsetY < -scrollView.contentInset.top {
                     scrollView.contentOffset.y = -scrollView.contentInset.top
                 } else {
-                    scrollViewDidChangeContentOffset(dragging: scrollView.isDragging)
+                    scrollViewDidChangeContentOffset(dragging: scrollView.isDragging || ignoreDragging)
                 }
                 layoutSubviews()
             }
         } else if keyPath == DGElasticPullToRefreshConstants.KeyPaths.ContentInset {
             if let newContentInset = change?[NSKeyValueChangeKey.newKey] {
-                let newContentInsetTop = (newContentInset as AnyObject).uiEdgeInsetsValue.top
-                originalContentInsetTop = newContentInsetTop
+                // Prevent `originalContentInsetTop` changes if it was caused during loading animation while we have enlarged top inset.
+                if state != .loading {
+                    let newContentInsetTop = (newContentInset as AnyObject).uiEdgeInsetsValue.top
+                    originalContentInsetTop = newContentInsetTop
+                }
             }
         } else if keyPath == DGElasticPullToRefreshConstants.KeyPaths.Frame {
             layoutSubviews()
         } else if keyPath == DGElasticPullToRefreshConstants.KeyPaths.PanGestureRecognizerState {
             if let gestureState = scrollView()?.panGestureRecognizer.state, gestureState.dg_isAnyOf([.ended, .cancelled, .failed]) {
-                scrollViewDidChangeContentOffset(dragging: false)
+                scrollViewDidChangeContentOffset(dragging: ignoreDragging)
             }
         }
     }
-
+    
     // MARK: -
     // MARK: Notifications
     
-    func applicationWillEnterForeground() {
+    @objc func applicationWillEnterForeground() {
         if state == .loading {
             layoutSubviews()
         }
@@ -231,6 +254,9 @@ open class DGElasticPullToRefreshView: UIView {
     }
     
     fileprivate func currentWaveHeight() -> CGFloat {
+        guard waveEnable else {
+            return 0.0
+        }
         return min(bounds.height / 3.0 * 1.6, DGElasticPullToRefreshConstants.WaveMaxHeight)
     }
     
@@ -258,13 +284,14 @@ open class DGElasticPullToRefreshView: UIView {
         if state == .stopped && dragging {
             state = .dragging
         } else if state == .dragging && dragging == false {
-            if offsetY >= DGElasticPullToRefreshConstants.MinOffsetToPull {
+            if offsetY >= minOffsetToPull {
                 state = .animatingBounce
+                justTransitionedToAnimatingBounce = true
             } else {
                 state = .stopped
             }
         } else if state.isAnyOf([.dragging, .stopped]) {
-            let pullProgress: CGFloat = offsetY / DGElasticPullToRefreshConstants.MinOffsetToPull
+            let pullProgress: CGFloat = offsetY / minOffsetToPull
             loadingView?.setPullProgress(pullProgress)
         }
     }
@@ -272,18 +299,17 @@ open class DGElasticPullToRefreshView: UIView {
     fileprivate func resetScrollViewContentInset(shouldAddObserverWhenFinished: Bool, animated: Bool, completion: (() -> ())?) {
         guard let scrollView = scrollView() else { return }
         
-        var contentInset = scrollView.contentInset
-        contentInset.top = originalContentInsetTop
+        var topContentInset = originalContentInsetTop
         
         if state == .animatingBounce {
-            contentInset.top += currentHeight()
+            topContentInset += currentHeight()
         } else if state == .loading {
-            contentInset.top += DGElasticPullToRefreshConstants.LoadingContentInset
+            topContentInset += DGElasticPullToRefreshConstants.LoadingContentInset
         }
         
         scrollView.dg_removeObserver(self, forKeyPath: DGElasticPullToRefreshConstants.KeyPaths.ContentInset)
         
-        let animationBlock = { scrollView.contentInset = contentInset }
+        let animationBlock = { scrollView.contentInset.top = topContentInset }
         let completionBlock = { () -> Void in
             if shouldAddObserverWhenFinished && self.observing {
                 scrollView.dg_addObserver(self, forKeyPath: DGElasticPullToRefreshConstants.KeyPaths.ContentInset)
@@ -313,12 +339,12 @@ open class DGElasticPullToRefreshView: UIView {
         
         let centerY = DGElasticPullToRefreshConstants.LoadingContentInset
         let duration = 0.9
-        
+        let oldScrollEnabledState = scrollView.isScrollEnabled
         scrollView.isScrollEnabled = false
         startDisplayLink()
         scrollView.dg_removeObserver(self, forKeyPath: DGElasticPullToRefreshConstants.KeyPaths.ContentOffset)
         scrollView.dg_removeObserver(self, forKeyPath: DGElasticPullToRefreshConstants.KeyPaths.ContentInset)
-        UIView.animate(withDuration: duration, delay: 0.0, usingSpringWithDamping: 0.43, initialSpringVelocity: 0.0, options: [], animations: { [weak self] in
+        UIView.animate(withDuration: duration, delay: 0.0, usingSpringWithDamping: self.pullSpringWithDamping, initialSpringVelocity: 0.0, options: [], animations: { [weak self] in
             self?.cControlPointView.center.y = centerY
             self?.l1ControlPointView.center.y = centerY
             self?.l2ControlPointView.center.y = centerY
@@ -331,10 +357,10 @@ open class DGElasticPullToRefreshView: UIView {
                 self?.resetScrollViewContentInset(shouldAddObserverWhenFinished: true, animated: false, completion: nil)
                 if let strongSelf = self, let scrollView = strongSelf.scrollView() {
                     scrollView.dg_addObserver(strongSelf, forKeyPath: DGElasticPullToRefreshConstants.KeyPaths.ContentOffset)
-                    scrollView.isScrollEnabled = true
+                    scrollView.isScrollEnabled = oldScrollEnabledState
                 }
                 self?.state = .loading
-            })
+        })
         
         bounceAnimationHelperView.center = CGPoint(x: 0.0, y: originalContentInsetTop + currentHeight())
         UIView.animate(withDuration: duration * 0.4, animations: { [weak self] in
@@ -355,14 +381,17 @@ open class DGElasticPullToRefreshView: UIView {
         displayLink.isPaused = true
     }
     
-    func displayLinkTick() {
+    @objc func displayLinkTick() {
         let width = bounds.width
         var height: CGFloat = 0.0
         
         if state == .animatingBounce {
             guard let scrollView = scrollView() else { return }
-        
-            scrollView.contentInset.top = bounceAnimationHelperView.dg_center(isAnimating()).y
+            
+            if !justTransitionedToAnimatingBounce || snapToTopOnInitialAnimatingBounce {
+                scrollView.contentInset.top = bounceAnimationHelperView.dg_center(isAnimating()).y
+            }
+            
             scrollView.contentOffset.y = -scrollView.contentInset.top
             
             height = scrollView.contentInset.top - originalContentInsetTop
@@ -371,7 +400,7 @@ open class DGElasticPullToRefreshView: UIView {
         } else if state == .animatingToStopped {
             height = actualContentOffsetY()
         }
-    
+        
         shapeLayer.frame = CGRect(x: 0.0, y: 0.0, width: width, height: height)
         shapeLayer.path = currentPath()
         
